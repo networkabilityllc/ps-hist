@@ -1,5 +1,6 @@
 mod app;
 mod db;
+mod highlight;
 mod import;
 mod input;
 mod ui;

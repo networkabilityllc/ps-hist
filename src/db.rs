@@ -172,3 +172,37 @@ pub fn list_hosts(conn: &Connection) -> Result<Vec<HostSummary>> {
     }
     Ok(hosts)
 }
+
+/// One history row as shown in the browser.
+pub struct CommandRow {
+    pub command: String,
+    pub hostname: String,
+}
+
+/// Commands containing `query` (case-insensitive), newest first,
+/// optionally limited to one host. An empty query matches everything.
+pub fn visible_commands(conn: &Connection, query: &str, host: Option<i64>) -> Result<Vec<CommandRow>> {
+    let pattern = format!(
+        "%{}%",
+        query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    );
+    let mut stmt = conn.prepare(
+        "SELECT c.command, h.hostname
+         FROM history c
+         JOIN hosts h ON h.id = c.host_id
+         WHERE (?1 IS NULL OR c.host_id = ?1)
+           AND (?2 = '' OR c.command LIKE ?3 ESCAPE '\\')
+         ORDER BY c.id DESC",
+    )?;
+    let rows = stmt.query_map(params![host, query, pattern], |row| {
+        Ok(CommandRow {
+            command: row.get(0)?,
+            hostname: row.get(1)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}

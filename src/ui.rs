@@ -131,8 +131,13 @@ impl Screen {
     }
 
     /// Write the frame. With a cursor position, show the cursor there; otherwise hide it.
+    ///
+    /// The frame is wrapped in synchronized-output markers (DEC mode 2026), so the
+    /// terminal holds rendering until the whole frame has arrived. Terminals that
+    /// don't support the mode ignore the markers.
     pub fn flush(&self, cursor: Option<(i32, i32)>) -> io::Result<()> {
-        let mut out = String::with_capacity(self.parts.len() + 32);
+        let mut out = String::with_capacity(self.parts.len() + 48);
+        out.push_str("\x1b[?2026h");
         out.push_str(&self.parts);
         out.push_str(RESET);
         match cursor {
@@ -141,6 +146,7 @@ impl Screen {
             }
             _ => out.push_str("\x1b[?25l"),
         }
+        out.push_str("\x1b[?2026l");
         let mut stdout = io::stdout().lock();
         stdout.write_all(out.as_bytes())?;
         stdout.flush()
