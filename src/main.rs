@@ -1,5 +1,7 @@
+mod app;
 mod db;
 mod import;
+mod input;
 mod ui;
 
 use std::io::IsTerminal;
@@ -35,9 +37,10 @@ fn main() -> db::Result<()> {
     let mut conn = db::open(&db_path)?;
     let host = db::current_host();
     let host_id = db::register_host(&conn, &host)?;
+    let host_label = format!("{}\\{}", host.hostname, host.username);
 
     println!("Database:  {}", db_path.display());
-    println!("This host: {}\\{} (id {})", host.hostname, host.username, host_id);
+    println!("This host: {} (id {})", host_label, host_id);
     println!();
 
     let mut files = import::default_history_files();
@@ -71,20 +74,20 @@ fn main() -> db::Result<()> {
         import::mark_imported(&conn, host_id)?;
     }
 
-    println!();
-    println!("Known hosts:");
-    for h in db::list_hosts(&conn)? {
-        let last = h.last_import.as_deref().unwrap_or("never");
-        println!(
-            "  [{}] {}\\{}  {} commands  last import: {}",
-            h.id, h.hostname, h.username, h.commands, last
-        );
-    }
-
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if import_only || !interactive {
+        println!();
+        println!("Known hosts:");
+        for h in db::list_hosts(&conn)? {
+            let last = h.last_import.as_deref().unwrap_or("never");
+            println!(
+                "  [{}] {}\\{}  {} commands  last import: {}",
+                h.id, h.hostname, h.username, h.commands, last
+            );
+        }
         return Ok(());
     }
-    ui::run(&format!("{} new entries imported", total))?;
-    Ok(())
+
+    let status = format!("{} new entries imported", ui::thousands(total as i64));
+    app::App::new(conn, db_path, host_id, host_label, files, status).run()
 }

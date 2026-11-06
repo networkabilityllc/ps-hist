@@ -4,10 +4,8 @@
 #![allow(dead_code)]
 
 use std::io::{self, Write};
-use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     self, Clear, ClearType, DisableLineWrap, EnableLineWrap, EnterAlternateScreen,
@@ -26,7 +24,7 @@ macro_rules! sgr {
 // Classic 16-colour palette, in the spirit of mid-80s DOS menu shells.
 pub const MENUBAR: &str = sgr!(30, 47);
 pub const MENUBAR_HOT: &str = sgr!(31, 47);
-pub const DESKTOP: &str = sgr!(37, 44);
+pub const DESKTOP: &str = sgr!(94, 44);
 pub const SHADOW: &str = sgr!(37, 40);
 pub const WIN_BORDER: &str = sgr!(97, 44);
 pub const WIN_TITLE: &str = sgr!(93, 44);
@@ -36,7 +34,7 @@ pub const WIN_KEY: &str = sgr!(93, 44);
 pub const WIN_SEL: &str = sgr!(30, 46);
 pub const SCROLL: &str = sgr!(36, 44);
 pub const SCROLL_THUMB: &str = sgr!(96, 44);
-pub const DLG_BORDER: &str = sgr!(97, 47);
+pub const DLG_BORDER: &str = sgr!(30, 47);
 pub const DLG_TITLE: &str = sgr!(30, 47);
 pub const DLG_TEXT: &str = sgr!(30, 47);
 pub const DLG_HOT: &str = sgr!(31, 47);
@@ -153,6 +151,28 @@ pub fn clock() -> String {
     chrono::Local::now().format("%H:%M").to_string()
 }
 
+/// Format a number with thousands separators: 4538 -> "4,538".
+pub fn thousands(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if n < 0 {
+        format!("-{}", out)
+    } else {
+        out
+    }
+}
+
+/// Visible width of hotkey markup, ignoring the ~ markers.
+pub fn plain_len(markup: &str) -> i32 {
+    markup.chars().filter(|&ch| ch != '~').count() as i32
+}
+
 /// Draw text where ~X~ marks a hotkey highlight. Returns the visible width.
 pub fn hot(scr: &mut Screen, row: i32, col: i32, markup: &str, normal: &str, accent: &str) -> i32 {
     let start = col;
@@ -213,6 +233,22 @@ pub fn centered(scr: &Screen, h: i32, w: i32) -> (i32, i32) {
     (top, left)
 }
 
+/// A centred row of push-buttons with shadows; `focus` is the highlighted one.
+pub fn draw_buttons(scr: &mut Screen, row: i32, left: i32, w: i32, labels: &[&str], focus: usize) {
+    let widths: Vec<i32> = labels.iter().map(|label| plain_len(label) + 3).collect();
+    let total: i32 = widths.iter().sum::<i32>() + 2 * (labels.len() as i32 - 1);
+    let mut col = left + (w - total) / 2;
+    for (i, label) in labels.iter().enumerate() {
+        let text = format!(" {} ", label);
+        let width = plain_len(&text);
+        let normal = if i == focus { BTN_FOCUS } else { BTN };
+        hot(scr, row, col, &text, normal, BTN_HOT);
+        scr.at(row, col + width, "▄", BTN_SHADOW);
+        scr.at(row + 1, col + 1, &"▀".repeat(width as usize), BTN_SHADOW);
+        col += widths[i] + 2;
+    }
+}
+
 /// Menu bar, patterned desktop, and status bar with key hints.
 pub fn desktop(scr: &mut Screen, hint_markup: &str, status: &str) {
     if scr.width < MIN_WIDTH || scr.height < MIN_HEIGHT {
@@ -239,68 +275,12 @@ pub fn desktop(scr: &mut Screen, hint_markup: &str, status: &str) {
     }
 }
 
-/// Temporary screen for this step: the desktop with an empty main-menu window.
-fn draw_preview(scr: &mut Screen, status: &str) {
-    desktop(scr, "~Esc~ Exit", status);
+/// Replace the status-bar hints (used while a dialog is open).
+pub fn status_bar(scr: &mut Screen, hint_markup: &str) {
     if scr.blocked {
         return;
     }
-    let (w, h) = (38, 9);
-    let (top, left) = centered(scr, h, w);
-    draw_box(scr, top, left, h, w, DLG_BORDER, "Main Menu", DLG_TITLE);
-    let inner = (w - 2) as usize;
-    scr.at(top + 1, left + 1, &format!("{:^inner$}", "▓▒░  P S - H I S T  ░▒▓"), DLG_BANNER);
-    scr.at(top + 2, left + 1, &format!("{:^inner$}", "PowerShell Command History"), DLG_TEXT);
-    separator(scr, top + 3, left, w, DLG_BORDER);
-    scr.at(top + 5, left + 1, &format!("{:^inner$}", "Menu coming in the next step"), DLG_TEXT);
-}
-
-/// Run the full-screen interface until the user exits.
-pub fn run(status: &str) -> io::Result<()> {
-    let _terminal = Terminal::enter()?;
-    let mut last_size: Option<(i32, i32)> = None;
-    let mut last_clock = String::new();
-    let mut redraw = true;
-
-    loop {
-        let now = clock();
-        if now != last_clock {
-            last_clock = now;
-            redraw = true;
-        }
-
-        if redraw {
-            let mut scr = Screen::new();
-            if last_size != Some((scr.width, scr.height)) {
-                scr.clear();
-                last_size = Some((scr.width, scr.height));
-            }
-            draw_preview(&mut scr, status);
-            scr.flush(None)?;
-            redraw = false;
-        }
-
-        if event::poll(Duration::from_millis(500))? {
-            match event::read()? {
-                // Windows reports both key press and release; act on presses only.
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let ctrl_c = key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL);
-                    let exit = matches!(
-                        key.code,
-                        KeyCode::Esc
-                            | KeyCode::Char('x')
-                            | KeyCode::Char('X')
-                            | KeyCode::Char('q')
-                            | KeyCode::Char('Q')
-                    );
-                    if ctrl_c || exit {
-                        return Ok(());
-                    }
-                }
-                Event::Resize(_, _) => redraw = true,
-                _ => {}
-            }
-        }
-    }
+    let (w, h) = (scr.width, scr.height);
+    scr.at(h, 1, &" ".repeat(w as usize), MENUBAR);
+    hot(scr, h, 2, hint_markup, MENUBAR, MENUBAR_HOT);
 }
