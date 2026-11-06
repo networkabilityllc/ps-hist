@@ -1,6 +1,8 @@
 mod db;
 mod import;
+mod ui;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -16,10 +18,15 @@ struct Args {
     /// Additional history file to import for this host (repeatable)
     #[arg(long)]
     history_file: Vec<PathBuf>,
+
+    /// Import history and print a report without opening the interactive UI
+    #[arg(long)]
+    import_only: bool,
 }
 
 fn main() -> db::Result<()> {
     let args = Args::parse();
+    let import_only = args.import_only;
     let db_path = match args.db {
         Some(path) => path,
         None => db::default_database()?,
@@ -40,11 +47,11 @@ fn main() -> db::Result<()> {
         }
     }
 
+    let mut total = 0;
     if files.is_empty() {
         println!("No history files found. Use --history-file to specify one.");
     } else {
         println!("Import:");
-        let mut total = 0;
         for path in &files {
             match import::import_file(&mut conn, host_id, path) {
                 Ok(report) => {
@@ -73,5 +80,11 @@ fn main() -> db::Result<()> {
             h.id, h.hostname, h.username, h.commands, last
         );
     }
+
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if import_only || !interactive {
+        return Ok(());
+    }
+    ui::run(&format!("{} new entries imported", total))?;
     Ok(())
 }
