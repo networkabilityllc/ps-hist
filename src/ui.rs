@@ -51,6 +51,32 @@ pub const FIELD_KEY: &str = sgr!(93, 44);
 pub const MIN_WIDTH: i32 = 50;
 pub const MIN_HEIGHT: i32 = 16;
 
+/// Enter full-screen raw mode.
+pub fn resume() -> io::Result<()> {
+    terminal::enable_raw_mode()?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        DisableLineWrap,
+        Hide,
+        Clear(ClearType::All)
+    )
+}
+
+/// Leave full-screen raw mode and give the normal console back.
+pub fn suspend() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    stdout.write_all(RESET.as_bytes())?;
+    execute!(
+        stdout,
+        Clear(ClearType::All),
+        EnableLineWrap,
+        Show,
+        LeaveAlternateScreen
+    )?;
+    terminal::disable_raw_mode()
+}
+
 /// Puts the terminal into full-screen raw mode, and restores it when dropped.
 ///
 /// Because restoring happens in Drop, the terminal is put back even if the
@@ -59,30 +85,14 @@ pub struct Terminal;
 
 impl Terminal {
     pub fn enter() -> io::Result<Terminal> {
-        terminal::enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            DisableLineWrap,
-            Hide,
-            Clear(ClearType::All)
-        )?;
+        resume()?;
         Ok(Terminal)
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        let mut stdout = io::stdout();
-        let _ = stdout.write_all(RESET.as_bytes());
-        let _ = execute!(
-            stdout,
-            Clear(ClearType::All),
-            EnableLineWrap,
-            Show,
-            LeaveAlternateScreen
-        );
-        let _ = terminal::disable_raw_mode();
+        let _ = suspend();
     }
 }
 

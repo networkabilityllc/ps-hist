@@ -9,10 +9,11 @@ use crate::db;
 use crate::highlight;
 use crate::import;
 use crate::input::{self, Input, Key};
+use crate::shell;
 use crate::ui::{
-    self, Screen, DLG_BANNER, DLG_BORDER, DLG_HOT, DLG_TEXT, DLG_TITLE, FIELD, MENU_SEL,
-    MENU_SEL_HOT, SCROLL, SCROLL_THUMB, WIN_BORDER, WIN_DIM, WIN_KEY, WIN_SEL, WIN_TEXT,
-    WIN_TITLE,
+    self, Screen, DLG_BANNER, DLG_BORDER, DLG_HOT, DLG_TEXT, DLG_TITLE, FIELD, FIELD_KEY,
+    MENU_SEL, MENU_SEL_HOT, SCROLL, SCROLL_THUMB, WIN_BORDER, WIN_DIM, WIN_KEY, WIN_SEL,
+    WIN_TEXT, WIN_TITLE,
 };
 
 /// Everything the history browser needs to draw itself.
@@ -42,6 +43,14 @@ enum Action {
     Import,
     Info,
     Quit,
+}
+
+/// What the user chose in the Run Command dialog.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunChoice {
+    Run,
+    Edit,
+    Copy,
 }
 
 /// Main-menu entries; ~X~ marks the hotkey, None draws a divider.
@@ -93,6 +102,7 @@ pub struct App {
     host_id: i64,
     host_label: String,
     files: Vec<PathBuf>,
+    shell: PathBuf,
     status: String,
     last_size: Option<(i32, i32)>,
     quit: bool,
@@ -105,6 +115,7 @@ impl App {
         host_id: i64,
         host_label: String,
         files: Vec<PathBuf>,
+        shell: PathBuf,
         status: String,
     ) -> App {
         App {
@@ -113,6 +124,7 @@ impl App {
             host_id,
             host_label,
             files,
+            shell,
             status,
             last_size: None,
             quit: false,
@@ -261,7 +273,269 @@ impl App {
         }
     }
 
+    /// Show the full command and ask what to do with it.
+    fn confirm_run(&mut self, command: &str, under: &View) -> db::Result<Option<RunChoice>> {
+        const ACTIONS: [Option<RunChoice>; 4] = [
+            Some(RunChoice::Run),
+            Some(RunChoice::Edit),
+            Some(RunChoice::Copy),
+            None,
+        ];
+        let shell_name = file_name(&self.shell);
+        let mut focus = 0;
+        loop {
+            if self.quit {
+                return Ok(None);
+            }
+            let mut scr = self.frame();
+            self.draw_view(&mut scr, under)?;
+            if !scr.blocked {
+                let w = (scr.width - 8).min(78);
+                let inner = (w - 6).max(1) as usize;
+                let options = textwrap::Options::new(inner)
+                    .word_splitter(textwrap::WordSplitter::NoHyphenation);
+                let mut lines: Vec<String> = Vec::new();
+                for part in command.replace("\r\n", "\n").replace('\r', "\n").split('\n') {
+                    let part = part.replace('\t', "    ");
+                    let wrapped = textwrap::wrap(&part, &options);
+                    if wrapped.is_empty() {
+                        lines.push(String::new());
+                    } else {
+                        lines.extend(wrapped.into_iter().map(|piece| piece.into_owned()));
+                    }
+                }
+                let limit = (scr.height - 12).max(1) as usize;
+                if lines.len() > limit {
+                    lines.truncate(limit - 1);
+                    lines.push("…".to_string());
+                }
+
+                let h = lines.len() as i32 + 7;
+                let (top, left) = ui::centered(&scr, h, w);
+                ui::draw_box(&mut scr, top, left, h, w, DLG_BORDER, "Run Command", DLG_TITLE);
+                scr.at(top + 2, left + 3, &format!("Execute in {}?", shell_name), DLG_TEXT);
+                for (i, line) in lines.iter().enumerate() {
+                    highlight::draw_command(
+                        &mut scr,
+                        top + 3 + i as i32,
+                        left + 3,
+                        inner as i32,
+                        line,
+                        FIELD,
+                        FIELD_KEY,
+                    );
+                }
+                ui::draw_buttons(
+                    &mut scr,
+                    top + h - 3,
+                    left,
+                    w,
+                    &["~R~un", "~E~dit", "~C~opy", "Cancel"],
+                    focus,
+                );
+                ui::status_bar(
+                    &mut scr,
+                    "~←→~ Choose  ~Enter~ Confirm  ~R~ Run  ~E~ Edit  ~C~ Copy  ~Esc~ Cancel",
+                );
+            }
+            scr.flush(None)?;
+            let Some(key) = self.wait_key()? else {
+                continue;
+            };
+            match key {
+                Key::Left => focus = (focus + ACTIONS.len() - 1) % ACTIONS.len(),
+                Key::Right | Key::Tab => focus = (focus + 1) % ACTIONS.len(),
+                Key::Enter => return Ok(ACTIONS[focus]),
+                Key::Char('r' | 'R') => return Ok(Some(RunChoice::Run)),
+                Key::Char('e' | 'E') => return Ok(Some(RunChoice::Edit)),
+                Key::Char('c' | 'C') => return Ok(Some(RunChoice::Copy)),
+                Key::Esc => return Ok(None),
+                _ => {}
+            }
+        }
+    }
+
+    /// Multi-line, cursor-aware editor for one command. Enter accepts, Esc cancels.
+    fn edit_dialog(&mut self, initial: &str, under: &View) -> db::Result<Option<String>> {
+        // Keep embedded newlines (shown as ↵) so multi-line commands survive editing.
+        let normalized = initial.replace("\r\n", "\n").replace('\r', "\n");
+        let mut value: Vec<char> = normalized
+            .chars()
+            .map(|ch| if ch == '\n' || !ch.is_control() { ch } else { ' ' })
+            .collect();
+        let mut cur = value.len();
+        let mut first = 0;
+        let mut inner = 72;
+
+        loop {
+            if self.quit {
+                return Ok(None);
+            }
+            let mut scr = self.frame();
+            self.draw_view(&mut scr, under)?;
+            let mut cursor = None;
+            if !scr.blocked {
+                let w = (scr.width - 8).min(78);
+                inner = (w - 6).max(1) as usize;
+                let rows = (scr.height - 14).clamp(1, 6) as usize;
+
+                // Hard-wrap by character so the cursor maps straight onto (row, col).
+                let mut lines: Vec<String> = Vec::new();
+                let mut start = 0;
+                while start <= value.len() {
+                    let end = (start + inner).min(value.len());
+                    lines.push(value[start..end].iter().collect());
+                    start += inner;
+                }
+                let (crow, ccol) = (cur / inner, cur % inner);
+                if crow < first {
+                    first = crow;
+                } else if crow >= first + rows {
+                    first = crow + 1 - rows;
+                }
+                first = first.min(lines.len().saturating_sub(rows));
+
+                let h = rows as i32 + 7;
+                let (top, left) = ui::centered(&scr, h, w);
+                ui::draw_box(&mut scr, top, left, h, w, DLG_BORDER, "Edit Command", DLG_TITLE);
+                scr.at(top + 2, left + 3, "Edit the command, then press Enter to run it:", DLG_TEXT);
+                for i in 0..rows {
+                    let line = lines.get(first + i).map(String::as_str).unwrap_or("");
+                    highlight::draw_command(
+                        &mut scr,
+                        top + 3 + i as i32,
+                        left + 3,
+                        inner as i32,
+                        line,
+                        FIELD,
+                        FIELD_KEY,
+                    );
+                }
+                if first > 0 {
+                    scr.at(top + 3, left + 3 + inner as i32, "▲", DLG_TEXT);
+                }
+                if first + rows < lines.len() {
+                    scr.at(top + 2 + rows as i32, left + 3 + inner as i32, "▼", DLG_TEXT);
+                }
+                ui::draw_buttons(&mut scr, top + h - 3, left, w, &["Run", "Cancel"], 0);
+                ui::status_bar(
+                    &mut scr,
+                    "~←→~ Move  ~Ctrl+←→~ Word  ~Home~/~End~ Start/End  ~Del~ Delete  ~Enter~ Run  ~Esc~ Cancel",
+                );
+                cursor = Some((top + 3 + (crow - first) as i32, left + 3 + ccol as i32));
+            }
+            scr.flush(cursor)?;
+
+            let Some(key) = self.wait_key()? else {
+                continue;
+            };
+            match key {
+                Key::Enter => return Ok(Some(value.iter().collect())),
+                Key::Esc => return Ok(None),
+                Key::Left => cur = cur.saturating_sub(1),
+                Key::Right => cur = (cur + 1).min(value.len()),
+                Key::Up => {
+                    if cur >= inner {
+                        cur -= inner;
+                    }
+                }
+                Key::Down => cur = (cur + inner).min(value.len()),
+                Key::Home => cur = 0,
+                Key::End => cur = value.len(),
+                Key::WordLeft => {
+                    while cur > 0 && value[cur - 1].is_whitespace() {
+                        cur -= 1;
+                    }
+                    while cur > 0 && !value[cur - 1].is_whitespace() {
+                        cur -= 1;
+                    }
+                }
+                Key::WordRight => {
+                    while cur < value.len() && !value[cur].is_whitespace() {
+                        cur += 1;
+                    }
+                    while cur < value.len() && value[cur].is_whitespace() {
+                        cur += 1;
+                    }
+                }
+                Key::Backspace => {
+                    if cur > 0 {
+                        value.remove(cur - 1);
+                        cur -= 1;
+                    }
+                }
+                Key::Delete => {
+                    if cur < value.len() {
+                        value.remove(cur);
+                    }
+                }
+                Key::Char(ch) if !ch.is_control() => {
+                    value.insert(cur, ch);
+                    cur += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
     // ── actions ──
+
+    fn run_command(&mut self, command: &str, under: &View) -> db::Result<()> {
+        #[cfg(windows)]
+        {
+            match shell::launch_window(&self.shell, command) {
+                Ok(()) => self.status = "Launched in a new PowerShell window".to_string(),
+                Err(error) => {
+                    self.status = "Could not start PowerShell".to_string();
+                    let lines = vec![format!("Could not start PowerShell: {}", error)];
+                    self.message_box("Error", &lines, under)?;
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = under;
+            ui::suspend()?;
+            println!("Running in {}:\n\n{}\n", self.shell.display(), command);
+            match shell::run_inline(&self.shell, command) {
+                Ok(code) => {
+                    println!("\nPowerShell exited with code {}.", code);
+                    self.status = format!("Last command exited with code {}", code);
+                }
+                Err(error) => {
+                    println!("\nCould not start PowerShell: {}", error);
+                    self.status = "Could not start PowerShell".to_string();
+                }
+            }
+            println!("Press Enter to return to the menu…");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            ui::resume()?;
+            self.last_size = None;
+        }
+        Ok(())
+    }
+
+    fn copy(&mut self, command: &str) {
+        self.status = if shell::copy_to_clipboard(command) {
+            "Copied to clipboard".to_string()
+        } else {
+            "Clipboard copy failed".to_string()
+        };
+    }
+
+    /// Edit a command; if accepted, record it in this host's history and run it.
+    fn edit_and_run(&mut self, command: &str, under: &View) -> db::Result<bool> {
+        let Some(edited) = self.edit_dialog(command, under)? else {
+            return Ok(false);
+        };
+        if edited.trim().is_empty() {
+            return Ok(false);
+        }
+        db::record_command(&self.conn, self.host_id, &edited)?;
+        self.run_command(&edited, under)?;
+        Ok(true)
+    }
 
     fn reimport(&mut self, under: &View) -> db::Result<()> {
         let mut total = 0;
@@ -299,6 +573,7 @@ impl App {
         let mut lines = vec![
             format!("Database:  {}", self.db_path.display()),
             format!("This host: {}", self.host_label),
+            format!("Shell:     {}", self.shell.display()),
             format!("Entries:   {}", ui::thousands(self.scalar("SELECT COUNT(*) FROM history")?)),
             String::new(),
             "Hosts:".to_string(),
@@ -590,8 +865,24 @@ impl App {
                     }
                 }
                 Key::Enter | Key::Char('e' | 'E' | 'c' | 'C') if !st.rows.is_empty() => {
-                    let lines = vec!["Run, Edit and Copy come in the next step.".to_string()];
-                    self.message_box("Not Yet", &lines, &View::Browse(&st))?;
+                    let command = st.rows[st.selected].command.clone();
+                    let choice = match key {
+                        Key::Enter => self.confirm_run(&command, &View::Browse(&st))?,
+                        Key::Char('e' | 'E') => Some(RunChoice::Edit),
+                        _ => Some(RunChoice::Copy),
+                    };
+                    match choice {
+                        Some(RunChoice::Run) => self.run_command(&command, &View::Browse(&st))?,
+                        Some(RunChoice::Copy) => self.copy(&command),
+                        Some(RunChoice::Edit) => {
+                            if self.edit_and_run(&command, &View::Browse(&st))? {
+                                // The edited command is now the newest entry; jump to it.
+                                st.rows = db::visible_commands(&self.conn, &st.query, st.host)?;
+                                st.selected = 0;
+                            }
+                        }
+                        None => {}
+                    }
                 }
                 _ => {}
             }

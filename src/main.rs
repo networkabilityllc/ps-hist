@@ -3,6 +3,7 @@ mod db;
 mod highlight;
 mod import;
 mod input;
+mod shell;
 mod ui;
 
 use std::io::IsTerminal;
@@ -22,6 +23,10 @@ struct Args {
     #[arg(long)]
     history_file: Vec<PathBuf>,
 
+    /// PowerShell executable (defaults to pwsh, then powershell)
+    #[arg(long)]
+    shell: Option<PathBuf>,
+
     /// Import history and print a report without opening the interactive UI
     #[arg(long)]
     import_only: bool,
@@ -30,6 +35,11 @@ struct Args {
 fn main() -> db::Result<()> {
     let args = Args::parse();
     let import_only = args.import_only;
+    let shell = match args.shell {
+        Some(path) => path,
+        None => shell::find_powershell()
+            .ok_or("could not find pwsh or powershell; pass --shell with its path")?,
+    };
     let db_path = match args.db {
         Some(path) => path,
         None => db::default_database()?,
@@ -40,10 +50,6 @@ fn main() -> db::Result<()> {
     let host_id = db::register_host(&conn, &host)?;
     let host_label = format!("{}\\{}", host.hostname, host.username);
 
-    println!("Database:  {}", db_path.display());
-    println!("This host: {} (id {})", host_label, host_id);
-    println!();
-
     let mut files = import::default_history_files();
     for extra in args.history_file {
         if !files.contains(&extra) {
@@ -51,32 +57,42 @@ fn main() -> db::Result<()> {
         }
     }
 
+    // Import first, collecting the report instead of printing it right away.
+    let mut report = vec![
+        format!("Database:  {}", db_path.display()),
+        format!("This host: {} (id {})", host_label, host_id),
+        String::new(),
+    ];
     let mut total = 0;
     if files.is_empty() {
-        println!("No history files found. Use --history-file to specify one.");
+        report.push("No history files found. Use --history-file to specify one.".to_string());
     } else {
-        println!("Import:");
+        report.push("Import:".to_string());
         for path in &files {
             match import::import_file(&mut conn, host_id, path) {
-                Ok(report) => {
-                    total += report.added;
-                    println!(
+                Ok(result) => {
+                    total += result.added;
+                    report.push(format!(
                         "  {:<9} {:>7} new of {:>7} read  {}",
-                        report.mode.label(),
-                        report.added,
-                        report.entries,
-                        report.path.display()
-                    );
+                        result.mode.label(),
+                        result.added,
+                        result.entries,
+                        result.path.display()
+                    ));
                 }
-                Err(error) => println!("  error     {}: {}", path.display(), error),
+                Err(error) => report.push(format!("  error     {}: {}", path.display(), error)),
             }
         }
-        println!("  {} new commands in total", total);
+        report.push(format!("  {} new commands in total", total));
         import::mark_imported(&conn, host_id)?;
     }
 
+    // Print the report only when not opening the interactive UI.
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if import_only || !interactive {
+        for line in &report {
+            println!("{}", line);
+        }
         println!();
         println!("Known hosts:");
         for h in db::list_hosts(&conn)? {
@@ -86,9 +102,13 @@ fn main() -> db::Result<()> {
                 h.id, h.hostname, h.username, h.commands, last
             );
         }
+        if !import_only {
+            println!();
+            println!("Run this program in a terminal to use the interactive menu.");
+        }
         return Ok(());
     }
 
     let status = format!("{} new entries imported", ui::thousands(total as i64));
-    app::App::new(conn, db_path, host_id, host_label, files, status).run()
+    app::App::new(conn, db_path, host_id, host_label, files, shell, status).run()
 }

@@ -206,3 +206,13 @@ pub fn visible_commands(conn: &Connection, query: &str, host: Option<i64>) -> Re
     }
     Ok(out)
 }
+
+/// Store an edited command for this host so it shows at the top of the history.
+pub fn record_command(conn: &Connection, host_id: i64, command: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO history(host_id, command, source, line_number, imported_at)
+         VALUES (?1, ?2, 'ps-hist (edited)', (SELECT COALESCE(MAX(id), 0) + 1 FROM history), ?3)",
+        params![host_id, command, now_stamp()],
+    )?;
+    Ok(())
+}
